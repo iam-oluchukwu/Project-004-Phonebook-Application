@@ -1,0 +1,152 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Project-004 Phonebook Application deployed with Application Load Balancer, Auto Scaling Group, EC2 Launch Template, and RDS MySQL.
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: Select the default VPC.
+
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Select all subnets of the default VPC so all Availability Zones can be used.
+
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+    Description: Latest Amazon Linux 2023 AMI.
+
+  GitHubRepoUrl:
+    Type: String
+    Default: https://github.com/iam-oluchukwu/Project-004-Phonebook-Application.git
+    Description: Public GitHub repository containing the Phonebook application.
+
+Resources:
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP traffic from anywhere to the Application Load Balancer
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+
+  EC2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP traffic only from the Application Load Balancer
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+
+  RDSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow MySQL traffic only from the EC2 instances
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref EC2SecurityGroup
+
+  RDSSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Subnets for the Phonebook RDS database
+      SubnetIds: !Ref SubnetIds
+
+  PhonebookDatabase:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Delete
+    Properties:
+      AllocatedStorage: '20'
+      DBName: clarusway_phonebook
+      DBInstanceClass: db.t3.micro
+      DBSubnetGroupName: !Ref RDSSubnetGroup
+      Engine: mysql
+      EngineVersion: '8.0.35'
+      MasterUsername: admin
+      MasterUserPassword: clarusway_1234
+      Port: '3306'
+      PubliclyAccessible: false
+      VPCSecurityGroups:
+        - !GetAtt RDSSecurityGroup.GroupId
+
+  PhonebookTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      HealthCheckPath: /
+      HealthCheckProtocol: HTTP
+      Port: 80
+      Protocol: HTTP
+      TargetType: instance
+      VpcId: !Ref VpcId
+
+  PhonebookLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Scheme: internet-facing
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+      Subnets: !Ref SubnetIds
+      Type: application
+
+  PhonebookListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref PhonebookTargetGroup
+      LoadBalancerArn: !Ref PhonebookLoadBalancer
+      Port: 80
+      Protocol: HTTP
+
+  PhonebookLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        ImageId: !Ref LatestAmiId
+        InstanceType: t3.micro
+        SecurityGroupIds:
+          - !Ref EC2SecurityGroup
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub Web Server of ${AWS::StackName}
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            dnf update -y
+            dnf install -y git python3 python3-pip
+            cd /home/ec2-user
+            git clone ${GitHubRepoUrl}
+            echo "${PhonebookDatabase.Endpoint.Address}" > /home/ec2-user/dbserver.endpoint
+            cd /home/ec2-user/Project-004-Phonebook-Application
+            pip3 install -r requirements.txt
+            nohup python3 phonebook-app.py > app.log 2>&1 &
+
+  PhonebookAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      DesiredCapacity: '2'
+      MinSize: '1'
+      MaxSize: '3'
+      HealthCheckGracePeriod: 90
+      HealthCheckType: ELB
+      LaunchTemplate:
+        LaunchTemplateId: !Ref PhonebookLaunchTemplate
+        Version: !GetAtt PhonebookLaunchTemplate.LatestVersionNumber
+      TargetGroupARNs:
+        - !Ref PhonebookTargetGroup
+      VPCZoneIdentifier: !Ref SubnetIds
+
+Outputs:
+  WebsiteURL:
+    Description: Phonebook Application Website URL
+    Value: !Sub http://${PhonebookLoadBalancer.DNSName}
